@@ -26,6 +26,7 @@ let collect_let_vars e =
     | V.Let(V.Mem(_, _, _), _, _)
 	-> failwith "Let-mem unsupported in collect_let_vars"
     | V.Let(V.Temp(var), e1, e2) -> var :: (loop e1) @ (loop e2)
+    | V.Ite(ce, te, fe) -> (loop ce) @ (loop te) @ (loop fe)
   in
     loop e
 
@@ -173,28 +174,34 @@ struct
       let ty = Vine_typecheck.infer_type None target_e in
       let le_op = if is_signed then V.SLE else V.LE in
       let midpoint a b =
-	let incr = if is_max then 0L else 1L in
+	let half_rounded x =
+	  let half = Int64.shift_right_logical x 1 in
+	    if Int64.logand x 1L = 0L then
+	      half
+	    else
+	      Int64.add half (if is_max then 0L else 1L)
+	in
 	  if is_signed then
 	    let (a', b') = ((sx ty a), (sx ty b)) in
 	    let sz = Int64.sub b' a' in
-	    let hf_sz = Vine_util.int64_udiv (Int64.add sz incr) 2L in
+	    let hf_sz = half_rounded sz in
 	    let mid = Int64.add a' hf_sz in
 	      assert(a' <= mid);
 	      assert(mid <= b');
 	      zx ty mid
 	  else
 	    let sz = Int64.sub b a in
-	    let hf_sz = Vine_util.int64_udiv (Int64.add sz incr) 2L in
+	    let hf_sz = half_rounded sz in
 	    let mid = Int64.add a hf_sz in
 	      assert(Vine_util.int64_ucompare a mid <= 0);
 	      assert(Vine_util.int64_ucompare mid b <= 0);
 	      mid
       in
       let rec loop min max =
-	assert(is_signed || min <= max);
 	if !opt_influence_details then
 	  Printf.printf "Binary search in [0x%Lx, 0x%Lx]\n"
 	    min max;
+	assert(is_signed || Vine_util.int64_ucompare min max <= 0);
 	if min = max then
 	  min
 	else
@@ -206,19 +213,19 @@ struct
 		if in_bounds then
 		  loop min mid
 		else
-		  loop (Int64.succ mid) max
+		  loop (zx ty (Int64.succ mid)) max
 	    else
 	      let cond_e = V.BinOp(le_op, mid_e, target_e) in
 	      let in_bounds = self#check_valid target_eq cond_e in
 		if in_bounds then
 		  loop mid max
 		else
-		  loop min (Int64.pred mid)
+		  loop min (zx ty (Int64.pred mid))
       in
       let wd = V.bits_of_width ty in
       let (min_limit, max_limit) =
 	if is_signed then
-	  (Int64.shift_left 1L (wd - 1),
+	  (sx ty (Int64.shift_left 1L (wd - 1)),
 	   Int64.shift_right_logical (-1L) (64-wd+1))
 	else
 	  (0L, Int64.shift_right_logical (-1L) (64-wd))
@@ -267,6 +274,8 @@ struct
 	done;
 	!num_hits
 
+    (* This is basically the #SAT algorithm used in the PLAS'09
+       paper. *)
     method private xor_walk_simple target_eq target_e count =
       let ty = Vine_typecheck.infer_type None target_e in
       let start = float ((V.bits_of_width ty) / 2) in
@@ -297,6 +306,13 @@ struct
       in
 	loop start 0
 
+    (* The general idea of using enumeration to get more precision,
+       embodied in this function, seems like a good one. This particular
+       approach also sometimes does well when the other constraints are
+       well-structured. But after thiking about it more I believe generating
+       only one set of XOR constraints isn't enough to get a precise and
+       accurate result, because the factor by which any one set of
+       constraints shrink the solution space has high variance. -SMcC *)
     method private xor_then_enum target_eq target_e count =
       let ty = Vine_typecheck.infer_type None target_e in
       let num_terms = (V.bits_of_width ty) / 4 in
@@ -372,8 +388,8 @@ struct
 		 sampled_i
 	     else
 	       (* Here's where we need XOR-streamlining *)
-	       (* self#xor_walk_simple target_eq target_e 50 *)
-	       self#xor_then_enum target_eq target_e 50
+	       self#xor_walk_simple target_eq target_e 50
+	       (* self#xor_then_enum target_eq target_e 50 *)
 	  )
 
     method measure_influence_common decls assigns cond_e target_e =
@@ -463,14 +479,18 @@ struct
 	(V.Constant(V.Int(vtype, 0L))) conjoined in
       let (free_decls, t_assigns, cond_e, target_e, inputs_influencing) =
 	form_man#collect_for_solving cond_assigns [cond] expr in
-      let i =
-	self#measure_influence_common free_decls t_assigns cond_e target_e in
-	Printf.printf "Estimated multipath influence at %s is %f\n"
-	  loc i;
-	Printf.printf "Inputs contributing to this target expression: %s\n"
-          (List.fold_left
-	     (fun a varble -> a ^ ", " ^ (V.var_to_string varble))
-	     "" inputs_influencing);
+	if measurements = [] then
+	  Printf.printf "No influence measurements at %s\n" loc
+	else
+	  let i = (self#measure_influence_common free_decls t_assigns
+		     cond_e target_e)
+	  in
+	    Printf.printf "Estimated multipath influence at %s is %f\n"
+	      loc i;
+	    Printf.printf "Inputs contributing to this target expression: %s\n"
+              (List.fold_left
+		 (fun a varble -> a ^ ", " ^ (V.var_to_string varble))
+		 "" inputs_influencing);
 
     method compute_all_multipath_influence =
       Hashtbl.iter (fun eip _ -> self#compute_multipath_influence eip)
@@ -563,15 +583,15 @@ struct
 
     method measure_influence_expr expr =
       let (v, ty) = fm#eval_int_exp_ty expr in
-	try (match ty with
-	       | V.REG_1  -> ignore(D.to_concrete_1 v)
-	       | V.REG_8  -> ignore(D.to_concrete_8 v)
-	       | V.REG_16 -> ignore(D.to_concrete_16 v)
-	       | V.REG_32 -> ignore(D.to_concrete_32 v)
-	       | V.REG_64 -> ignore(D.to_concrete_64 v)
-	       | _ -> failwith "Bad type in measure_influence_expr")
-	with NotConcrete _ ->	    
-	  self#measure_point_influence "expr" (D.to_symbolic_64 v)
+      let e = match ty with
+	| V.REG_1  -> D.to_symbolic_1 v
+	| V.REG_8  -> D.to_symbolic_8 v
+	| V.REG_16 -> D.to_symbolic_16 v
+	| V.REG_32 -> D.to_symbolic_32 v
+	| V.REG_64 -> D.to_symbolic_64 v
+	| _ -> failwith "Bad type in measure_influence_expr"
+      in
+	self#measure_point_influence "expr" e
 
     val mutable qualified = true
 

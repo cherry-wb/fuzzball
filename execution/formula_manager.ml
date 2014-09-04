@@ -61,6 +61,49 @@ struct
 	);
       !box
 
+  (* This function captures a kind of structure used for a function
+     that would naturally be written as recursive over the structure of
+     expressions, but wants to recuse into the definitions of temporary
+     variables. It's important to memoize such a function over the
+     temporaries, since otherwise a given temporary could appear
+     exponentially many times in the traversal for a deep expression. We
+     also pass the size of the variable when it's reused, since that's
+     useful information that may not otherwise be visible nearby. It
+     might also be worth caching between calls to this function, though
+     that's less critical. As with if_expr_temp this has a polymorphic
+     type, though in the motivating examples the result of the traversal
+     was always an int.
+  *)
+  let map_expr_temp form_man e f combine =
+    let cache = V.VarHash.create 101 in
+    let rec recurse e =
+      let rec maybe_recurse e var wd =
+	try
+	  V.VarHash.find cache var
+	with
+	    Not_found ->
+	      let box = ref None in
+		form_man#if_expr_temp_unit var
+		  (function
+		     | Some (e') ->
+			 let res = f recurse e' in
+			   V.VarHash.replace cache var res;
+			   box := Some (combine wd res)
+		     | None -> box := Some (f recurse e));
+		match !box with
+		  | Some res -> res
+		  | None -> failwith "Empty box invariant failure"
+      in
+	match e with
+	  | V.Lval(V.Temp((_, _,  V.REG_1) as var)) -> maybe_recurse e var  1
+	  | V.Lval(V.Temp((_, _,  V.REG_8) as var)) -> maybe_recurse e var  8
+	  | V.Lval(V.Temp((_, _, V.REG_16) as var)) -> maybe_recurse e var 16
+	  | V.Lval(V.Temp((_, _, V.REG_32) as var)) -> maybe_recurse e var 32
+	  | V.Lval(V.Temp((_, _, V.REG_64) as var)) -> maybe_recurse e var 64
+	  | _ -> f recurse e
+    in
+      f recurse e
+
   class formula_manager = object(self)
     val input_vars = Hashtbl.create 30
 
@@ -270,6 +313,8 @@ struct
 	      V.Let(V.Temp(v), (loop e1), (loop e2))
 	  | V.Let(V.Mem(_,_,_), _, _) ->	      
 	      failwith "Unexpected memory let in rewrite_for_solver"
+	  | V.Ite(ce, te, fe) ->
+	      V.Ite((loop ce), (loop te), (loop fe))
       in
 	loop e
 
@@ -403,8 +448,13 @@ struct
 		| V.REG_64 -> D.to_concrete_64 d
 		| _ -> failwith "Unexpected type in eval_expr"
 	      in
-		V.Constant(V.Int(ty, v))	      
-	  | _ ->
+		V.Constant(V.Int(ty, v))
+	  | V.Ite(ce, te, fe) -> cf_eval (V.Ite(loop ce, loop te, loop fe))
+	  | V.Let(_, _, _)
+	  | V.Unknown(_)
+	  | V.Name(_)
+	  | V.Constant(V.Str(_))
+	    ->
 	      Printf.printf "Can't evaluate %s\n" (V.exp_to_string e);
 	      failwith "Unexpected expr in eval_expr"
       in
@@ -468,7 +518,12 @@ struct
 		->
 	      loop (V.VarHash.find mem_axioms memvar)
 	  | V.Lval(lv) -> self#eval_var_from_ce ce lv
-	  | _ ->
+	  | V.Ite(ce, te, fe) -> cf_eval (V.Ite(loop ce, loop te, loop fe))
+	  | V.Let(_, _, _)
+	  | V.Unknown(_)
+	  | V.Name(_)
+	  | V.Constant(V.Str(_))
+	    ->
 	      Printf.printf "Can't evaluate %s\n" (V.exp_to_string e);
 	      failwith "Unexpected expr in eval_expr_from_ce"
       in
@@ -501,7 +556,12 @@ struct
 		       b)
 	  | V.Lval(V.Temp(_,s,_)) ->
 	      String.length s >= 3 && String.sub s 0 3 = "LTC"
-	  | _ ->
+	  | V.Ite(ce, te, fe) -> (loop ce) || (loop te) || (loop fe)
+	  | V.Let(_, _, _)
+	  | V.Unknown(_)
+	  | V.Name(_)
+	  | V.Constant(V.Str(_))
+	    ->
 	      failwith "Unexpected expr in has_loop_var"
       in
 	loop (D.to_symbolic_32 d)
@@ -601,24 +661,16 @@ struct
 	if v_true' = v_false' then
 	  v_true'
 	else
-	  let mask = match ty with
-	    | V.REG_1  ->            cond_v'
-	    | V.REG_8  -> D.cast1s8  cond_v'
-	    | V.REG_16 -> D.cast1s16 cond_v'
-	    | V.REG_32 -> D.cast1s32 cond_v'
-	    | V.REG_64 -> D.cast1s64 cond_v'
-	    | _ -> failwith "Unexpected type in mask_ite"
-	  in
-	  let (andop, orop, notop) =
+	  let func =
 	    match ty with
-	      | V.REG_1  -> (D.bitand1,  D.bitor1,  D.not1)
-	      | V.REG_8  -> (D.bitand8,  D.bitor8,  D.not8)
-	      | V.REG_16 -> (D.bitand16, D.bitor16, D.not16)
-	      | V.REG_32 -> (D.bitand32, D.bitor32, D.not32)
-	      | V.REG_64 -> (D.bitand64, D.bitor64, D.not64)
-	      | _ -> failwith "Unexpected type (2) in mask_ite"
+	      | V.REG_1  -> D.ite1
+	      | V.REG_8  -> D.ite8
+	      | V.REG_16 -> D.ite16
+	      | V.REG_32 -> D.ite32
+	      | V.REG_64 -> D.ite64
+	      | _ -> failwith "Unexpected type in make_ite"
 	  in
-	    orop (andop mask v_true') (andop (notop mask) v_false')
+	    func cond_v' v_true' v_false'
 
     method if_expr_temp_unit (n,_,_) (fn_t: V.exp option  -> unit) =
       (* The slightly weird structure here is because we *don't*
@@ -660,6 +712,7 @@ struct
 	| V.Cast(_, _, e1) -> walk e1
 	| V.Unknown(_) -> ()
 	| V.Let(_, e1, e2) -> walk e1; walk e2 
+	| V.Ite(ce, te, fe) -> walk ce; walk te; walk fe
       in
 	walk exp;
 	((List.rev !nontemps), (List.rev !temps))

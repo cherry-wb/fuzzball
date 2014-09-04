@@ -128,7 +128,7 @@ class linux_special_handler (fm : fragment_machine) =
       fm#store_short_conc addr v
   in
   let zero_region base len =
-    assert(len >= 0 && len <= 1073741824); (* sanity check *)
+    assert(len >= 0 && len <= 0x20000000); (* sanity check *)
     for i = 0 to len - 1 do
       fm#store_byte_idx base i 0
     done
@@ -139,6 +139,13 @@ class linux_special_handler (fm : fragment_machine) =
 	s.[i] <- ca.(i)
       done;
       s
+  in
+  let compare_fds fd1 fd2 error name =
+    if fd1 = fd2 then (
+      raise 
+        (Unix.Unix_error
+          (error, 
+           name, "")));
   in
 object(self)
   val unix_fds = 
@@ -165,6 +172,10 @@ object(self)
 
   val fd_info = Array.init 1024
     (fun _ -> { dirp_offset = 0; fname = ""; snap_pos = None })
+
+  val netlink_sim_sockfd = ref 1025
+  val netlink_sim_seq = ref 0L
+  val netlink_cnt = ref 0
 
   method errno err =
     match err with
@@ -327,7 +338,7 @@ object(self)
 	    else
 	      Unix.ADDR_UNIX(chroot path)
 	| 2 -> 
-	    assert(len = 6);
+	    assert(len = 6 || len = 14);
 	    let port_be = load_short buf and
 		addr_h  = load_byte (lea buf 0 0 2) and
 		addr_mh = load_byte (lea buf 0 0 3) and
@@ -344,8 +355,8 @@ object(self)
   method write_sockaddr sockaddr_oc addr addrlen_ptr =
     let dotted_addr_to_dat str =
       let dot1 = String.index str '.' in
-      let dot2 = String.index_from str dot1 '.' in
-      let dot3 = String.index_from str dot2 '.' in
+      let dot2 = String.index_from str (dot1 + 1) '.' in
+      let dot3 = String.index_from str (dot2 + 1) '.' in
       let b1 = int_of_string (String.sub str 0 dot1) and
 	  b2 = int_of_string (String.sub str (dot1 + 1) (dot2 - dot1 - 1)) and
 	  b3 = int_of_string (String.sub str (dot2 + 1) (dot3 - dot2 - 1)) and
@@ -614,8 +625,8 @@ object(self)
   val symbolic_fnames = Hashtbl.create 11
   val symbolic_fds = Hashtbl.create 11
 
-  method add_symbolic_file s =
-    Hashtbl.replace symbolic_fnames s ()
+  method add_symbolic_file s is_concolic =
+    Hashtbl.replace symbolic_fnames s is_concolic
 
   method private save_sym_fd_positions = 
     Hashtbl.iter
@@ -654,8 +665,21 @@ object(self)
 
   method sys_bind sockfd addr addrlen =
     try
-      Unix.bind (self#get_fd sockfd) (self#read_sockaddr addr addrlen);
+      if sockfd <> !netlink_sim_sockfd then (
+        Unix.bind (self#get_fd sockfd) (self#read_sockaddr addr addrlen));
       put_return 0L (* success *)
+    with
+      | Unix.Unix_error(err, _, _) -> self#put_errno err
+
+  method sys_accept sockfd addr addrlen_ptr =
+    try
+      compare_fds !netlink_sim_sockfd sockfd 
+        Unix.EOPNOTSUPP "Unsupported accept(2) on netlink socket fd";
+      let (sockfd_oc,socka_oc) = Unix.accept (self#get_fd sockfd) and
+          vt_fd = self#fresh_fd () in
+      self#write_sockaddr socka_oc addr addrlen_ptr;
+      Array.set unix_fds vt_fd (Some sockfd_oc);
+      put_return (Int64.of_int vt_fd)
     with
       | Unix.Unix_error(err, _, _) -> self#put_errno err
 
@@ -760,8 +784,11 @@ object(self)
   method sys_close fd =
     try
       let oc_fd = self#get_fd fd in
-      if (fd <> 1 && fd <> 2) then
-	Unix.close oc_fd;
+      if (fd <> 1 && fd <> 2) then (
+        if fd = !netlink_sim_sockfd then
+          netlink_sim_sockfd := 1025
+        else
+          Unix.close oc_fd);
       Array.set unix_fds fd None;
       Hashtbl.remove symbolic_fds fd;
       put_return 0L (* success *)
@@ -770,6 +797,8 @@ object(self)
 
   method sys_connect sockfd addr addrlen =
     try
+      compare_fds !netlink_sim_sockfd sockfd 
+        Unix.ENOSYS "connect(2) on netlink socket fd not implemented";
       Unix.connect (self#get_fd sockfd) (self#read_sockaddr addr addrlen);
       put_return 0L (* success *)
     with
@@ -977,9 +1006,18 @@ object(self)
 	self#put_errno Unix.ERANGE	
       else
 	(for i = 0 to len - 1 do
-	   store_word list i (Int64.of_int (oc_groups.(i)))
+	   store_word (lea list i 4 0) 0 (Int64.of_int (oc_groups.(i)))
 	 done;
 	 put_return (Int64.of_int len))
+
+  method sys_setgroups32 size list =
+    let oc_groups = Array.init size 
+      (fun i -> Int64.to_int (load_word (lea list i 4 0))) in
+    try
+      Unix.setgroups oc_groups;
+      put_return 0L;
+    with
+      | Unix.Unix_error(err, _, _) -> self#put_errno err
 
   method sys_getuid () = 
     put_return (Int64.of_int (Unix.getuid ()))
@@ -1052,17 +1090,24 @@ object(self)
 
   method sys_getpeername sockfd addr addrlen_ptr =
     try
+      compare_fds !netlink_sim_sockfd sockfd
+        Unix.ENOSYS "getpeername(2) on netlink socket fd not implemented";
       let socka_oc = Unix.getpeername (self#get_fd sockfd) in
-	self#write_sockaddr socka_oc addr addrlen_ptr;
-	put_return 0L (* success *)
+      self#write_sockaddr socka_oc addr addrlen_ptr;
+      put_return 0L (* success *)
     with
       | Unix.Unix_error(err, _, _) -> self#put_errno err
 
   method sys_getsockname sockfd addr addrlen_ptr =
     try
-      let socka_oc = Unix.getsockname (self#get_fd sockfd) in
-	self#write_sockaddr socka_oc addr addrlen_ptr;
-	put_return 0L (* success *)
+      if sockfd <> !netlink_sim_sockfd then (
+        let socka_oc = Unix.getsockname (self#get_fd sockfd) in
+        self#write_sockaddr socka_oc addr addrlen_ptr;)
+      else (
+        (* Storing nl_pid to be the PID of the userspace process *)
+	    store_word addr 4 (Int64.of_int (self#get_pid));
+      );
+      put_return 0L (* success *)
     with
       | Unix.Unix_error(err, _, _) -> self#put_errno err
 
@@ -1085,6 +1130,8 @@ object(self)
     put_return (Int64.of_int (-61)) (* ENODATA *)
 
   method sys_ioctl fd req argp =
+    compare_fds !netlink_sim_sockfd fd 
+      Unix.EOPNOTSUPP "Unsupported ioctl(2) on netlink socket fd";
     match req with
       | 0x5401L -> (* TCGETS *)
 	  let baud_to_flags = function
@@ -1210,6 +1257,9 @@ object(self)
 	  fm#store_short_conc (lea argp 0 0 4) 0; (* ws_xpixel *)
 	  fm#store_short_conc (lea argp 0 0 6) 0; (* ws_ypixel *)
 	  put_return 0L (* success *)
+      | 0x541bL -> (* FIONREAD *)
+	  (* Not sure how to support this in OCaml *)
+	  self#put_errno Unix.EINVAL
       | _ -> 	  raise (UnhandledSysCall ("Unhandled ioctl sub-call"))
 
   method sys_link oldpath newpath =
@@ -1221,6 +1271,8 @@ object(self)
 
   method sys_listen sockfd backlog =
     try
+      compare_fds !netlink_sim_sockfd sockfd
+        Unix.EOPNOTSUPP "Unsupported listen(2) on netlink socket fd";
       Unix.listen (self#get_fd sockfd) backlog;
       put_return 0L (* success *)
     with
@@ -1271,6 +1323,8 @@ object(self)
 	  
   method private mmap_common addr length prot flags fd offset =
     let fdi = Int64.to_int fd in
+    compare_fds !netlink_sim_sockfd fdi
+      Unix.ENOSYS "mmap(2) for netlink socket fd not implemented";
     let do_read addr = 
       let len = Int64.to_int length in
       let old_loc = Unix.lseek (self#get_fd fdi) 0 Unix.SEEK_CUR in
@@ -1336,18 +1390,36 @@ object(self)
     (* treat as no-op *)
     put_return 0L
 
-  method sys_open path flags mode =
-    try
-      let oc_flags = self#flags_to_oc_flags flags in
-      let oc_fd = Unix.openfile (chroot path) oc_flags mode and
+  method private open_throw path flags mode =
+    let oc_flags = self#flags_to_oc_flags flags in
+    let oc_fd = Unix.openfile (chroot path) oc_flags mode and
 	  vt_fd = self#fresh_fd () in
 	Array.set unix_fds vt_fd (Some oc_fd);
 	fd_info.(vt_fd).fname <- path;
 	fd_info.(vt_fd).dirp_offset <- 0;
 	(* XXX: canonicalize filename here? *)
 	if Hashtbl.mem symbolic_fnames path then
-	  Hashtbl.replace symbolic_fds vt_fd ();
+	  Hashtbl.replace symbolic_fds vt_fd
+	    (Hashtbl.find symbolic_fnames path);
 	put_return (Int64.of_int vt_fd)
+
+  method sys_open path flags mode =
+    try
+      self#open_throw path flags mode;
+    with
+      | Unix.Unix_error(err, _, _) -> self#put_errno err
+
+  method sys_openat dirfd path flags mode =
+    try
+      let dirpath = (if dirfd <> -100 then 
+                       ref fd_info.(dirfd).fname 
+                     else ref "" ) in
+      let dirpathlen = (String.length !dirpath) in
+      if dirpathlen > 0 then
+        if !dirpath.[dirpathlen - 1]  <> '/' then
+          dirpath := !dirpath ^ "/"; 
+      let fullpath = !dirpath ^ path in
+      self#open_throw fullpath flags mode;
     with
       | Unix.Unix_error(err, _, _) -> self#put_errno err
 
@@ -1378,52 +1450,102 @@ object(self)
   method sys_poll fds_buf nfds timeout_ms =
     let get_pollfd buf idx =
       let fd = load_word (lea buf idx 8 0) and
-	  events = load_short (lea buf idx 8 4) in
-	((self#get_fd (Int64.to_int fd)), events)
+          events = load_short (lea buf idx 8 4) in
+      ((Int64.to_int fd), events)
     in
     let put_pollfd buf idx flags =
       fm#store_short_conc (lea buf idx 8 6) flags
     in
     let filter_event flag pollfds =
-      List.map (fun (fd,_) -> fd)
-	(List.filter (fun (_,e) -> e land flag <> 0) pollfds)
+      List.map (fun (fd,_) -> (self#get_fd fd))
+    (List.filter (fun (_,e) -> e land flag <> 0) pollfds)
     in
     let timeout_f = (Int64.to_float timeout_ms) /. 1000.0 in
     let pollfds_a = Array.init nfds (get_pollfd fds_buf) in
+    Array.iter (
+      fun (fd,_) ->
+        compare_fds !netlink_sim_sockfd fd
+          Unix.ENOSYS "poll(2) for netlink socket fd not implemented";
+    ) pollfds_a;
     let pollfds = Array.to_list pollfds_a in
     let readfds = filter_event 0x1 (* POLLIN *) pollfds and
-	writefds = filter_event 0x4 (* POLLOUT *) pollfds and
-	execepfds = filter_event 0x3682 (* XXX others *) pollfds in
+        writefds = filter_event 0x4 (* POLLOUT *) pollfds and
+        execepfds = filter_event 0x3682 (* XXX others *) pollfds in
     let (r_fds, w_fds, e_fds) =
       Unix.select readfds writefds execepfds timeout_f in
     let count = ref 0 in
-      for i = 0 to nfds - 1 do
-	let (oc_fd,_) = pollfds_a.(i) in
-	let r_flag = if List.mem oc_fd r_fds then 0x1 else 0 and
-	    w_flag = if List.mem oc_fd w_fds then 0x4 else 0 in
-	let flags = (r_flag lor w_flag) (* XXX other flags? *) in
-	  if flags <> 0 then
-	    count := !count + 1;
-	  put_pollfd fds_buf i flags
-      done;
-      put_return (Int64.of_int !count)
+    for i = 0 to nfds - 1 do
+      let (fd,_) = pollfds_a.(i) in
+      let oc_fd = self#get_fd fd in
+      let r_flag = if List.mem oc_fd r_fds then 0x1 else 0 and
+          w_flag = if List.mem oc_fd w_fds then 0x4 else 0 in
+      let flags = (r_flag lor w_flag) (* XXX other flags? *) in
+      if flags <> 0 then
+        count := !count + 1;
+      put_pollfd fds_buf i flags
+    done;
+    put_return (Int64.of_int !count)
+
+  method private read_throw fd buf count =
+    let str = self#string_create count in
+    let oc_fd = self#get_fd fd in
+    let num_read = Unix.read oc_fd str 0 count in
+      if num_read > 0 && Hashtbl.mem symbolic_fds fd then
+	let is_concolic = Hashtbl.find symbolic_fds fd in
+	  fm#maybe_start_symbolic
+	    (fun () ->
+	       (if is_concolic then
+		  fm#store_concolic_cstr buf (String.sub str 0 num_read) false
+		else
+		  fm#make_symbolic_region buf num_read;
+		max_input_string_length :=
+		  max (!max_input_string_length) num_read))
+      else
+	fm#store_str buf 0L (String.sub str 0 num_read);
+      put_return (Int64.of_int num_read)
 
   method sys_read fd buf count =
     try
-      let str = self#string_create count in
+      self#read_throw fd buf count
+    with
+      | Unix.Unix_error(err, _, _) -> self#put_errno err
+
+  method sys_readv fd iov cnt =
+    try
+      let num_bytes = self#iovec_size iov cnt in
+      let str = self#string_create num_bytes in
       let oc_fd = self#get_fd fd in
-      let num_read = Unix.read oc_fd str 0 count in
-	if num_read > 0 && Hashtbl.mem symbolic_fds fd then    
-	  fm#maybe_start_symbolic
-	    (fun () -> (fm#make_symbolic_region buf num_read;
-			max_input_string_length :=
-			  max (!max_input_string_length) num_read))
-	else
-	  fm#store_str buf 0L (String.sub str 0 num_read);
+      let num_read = Unix.read oc_fd str 0 num_bytes in
+	assert(not (Hashtbl.mem symbolic_fds fd)); (* unimplemented *)
+	self#scatter_iovec iov cnt str;
 	put_return (Int64.of_int num_read)
     with
       | Unix.Unix_error(err, _, _) -> self#put_errno err
-	  
+
+  method sys_pread64 fd buf count off =
+    let oc_fd = self#get_fd fd in
+      try
+	let old_loc = Unix.lseek oc_fd 0 Unix.SEEK_CUR in
+	  try
+	    ignore(Unix.lseek oc_fd (Int64.to_int off) Unix.SEEK_SET);
+	    let err_or = ref None in
+	      (try
+		 self#read_throw fd buf count
+	       with
+		 | Unix.Unix_error(err, _, _) -> err_or := Some err);
+	      (try
+		 ignore(Unix.lseek oc_fd old_loc Unix.SEEK_SET);
+	       with
+		 | Unix.Unix_error(err, _, _) -> ()
+		     (* ignore in favor of read error *) );
+	      match !err_or with
+		| Some err -> self#put_errno err
+		| None -> ()
+	  with
+	    | Unix.Unix_error(err, _, _) -> self#put_errno err
+      with
+	| Unix.Unix_error(err, _, _) -> self#put_errno err
+
   method sys_readlink path out_buf buflen =
     try
       let real = Unix.readlink (chroot path) in
@@ -1453,6 +1575,107 @@ object(self)
     with
       | Unix.Unix_error(err, _, _) -> self#put_errno err
 
+  method sys_recvfrom sockfd buf len flags addrbuf addrlen_ptr =
+    try
+      let str = self#string_create len in
+      let flags = (if (flags land 1) <> 0 then [Unix.MSG_OOB] else []) @
+		  (if (flags land 2) <> 0 then [Unix.MSG_PEEK] else [])
+      in
+      let (num_read, sockaddr) =
+	Unix.recvfrom (self#get_fd sockfd) str 0 len flags
+      in
+	if num_read > 0 && Hashtbl.mem symbolic_fds sockfd then
+	  fm#maybe_start_symbolic
+	    (fun () -> (fm#make_symbolic_region buf num_read;
+			max_input_string_length :=
+			  max (!max_input_string_length) num_read))
+	else
+	  fm#store_str buf 0L (String.sub str 0 num_read);
+	self#write_sockaddr sockaddr addrbuf addrlen_ptr;
+	put_return (Int64.of_int num_read) (* success *)
+    with
+      | Unix.Unix_error(err, _, _) -> self#put_errno err
+
+  method sys_shutdown sockfd how =
+    try
+      compare_fds !netlink_sim_sockfd sockfd
+        Unix.EOPNOTSUPP "Unsupported shutdown(2) for netlink socket fd";
+      let shutdown_cmd = match how with
+        | 0 -> Unix.SHUTDOWN_RECEIVE
+        | 1 -> Unix.SHUTDOWN_SEND
+        | 2 -> Unix.SHUTDOWN_ALL 
+        | _ -> raise (Unix.Unix_error(Unix.EINVAL, "Bad value for how", ""))
+      in
+      Unix.shutdown (self#get_fd sockfd) shutdown_cmd;
+    with
+      | Unix.Unix_error(err, _, _) -> self#put_errno err
+
+  method sys_recvmsg sockfd msg flags =
+    let store_nlmsg_newaddr buf =
+      (* nlmsghdr *)
+      store_word buf 0 32L;(* nlmsg_len *)
+      store_short buf 4 20;(* nlmsg_type *)
+      store_short buf 6 2;(* nlmsg_flags *)
+      store_word buf 8 !netlink_sim_seq;(* nlmsg_seq *)
+      store_word buf 12 (Int64.of_int (self#get_pid)); (* nlmsg_pid *)
+      (* ifaddrmsg *)
+      fm#store_byte_idx buf 16 2;(* ifa_family *)
+      fm#store_byte_idx buf 17 8;(* ifa_prefixlen *)
+      fm#store_byte_idx buf 18 128;(* ifa_flags *)
+      fm#store_byte_idx buf 19 254;(* ifa_scopre *)
+      store_word buf 20 1L;(* ifa_index *)
+      (* rta_attr *)
+      store_short buf 24 8;(* rta_len *)
+      store_short buf 26 1;(* rta_type *)
+      (* address *)
+      store_word buf 28 16777343L; (* storing 127.0.0.1 *)
+      put_return 32L;
+    in
+    let store_nlmsg_done buf =
+      store_word buf 0 20L;(* nlmsg_len = 20 *)
+      store_short buf 4 3;(* nlmsg_type = 3 *)
+      store_short buf 6 2;(* nlmsg_flags = 2 *)
+      store_word buf 8 !netlink_sim_seq;(* nlmsg_seq *)
+      store_word buf 12 (Int64.of_int (self#get_pid)); (* nlmsg_pid *)
+      put_return 20L;
+    in
+    try
+      if !netlink_sim_sockfd = sockfd then (
+        (* Store PID into nladdr.pid *)
+        let nladdr = lea msg 0 0 0 in
+	    store_word (load_word nladdr) 4 0L;
+	    (* store_word (load_word nladdr) 4 (Int64.of_int (self#get_pid)); *)
+        let iov = load_word (lea msg 0 0 8) in
+        let buf = load_word iov in
+        (match !netlink_cnt with
+        | 0 -> store_nlmsg_newaddr buf; incr netlink_cnt;
+        | 1 -> store_nlmsg_done buf; netlink_cnt := 0;
+        | _ -> 
+          failwith 
+            "No support for recvmsg(2) more than twice on netlink socket")
+      )
+      else (
+        let iov = load_word (lea msg 0 0 8) and
+            cnt = Int64.to_int (load_word (lea msg 0 0 12)) in
+        let len = self#iovec_size iov cnt in
+        let str = self#string_create len in
+        let flags = (if (flags land 1) <> 0 then [Unix.MSG_OOB] else []) @
+                    (if (flags land 2) <> 0 then [Unix.MSG_PEEK] else [])
+        and addrbuf = load_word (lea msg 0 0 0)
+        in
+        let (num_read, sockaddr) =
+          Unix.recvfrom (self#get_fd sockfd) str 0 len flags
+        in
+        assert(not (Hashtbl.mem symbolic_fds sockfd)); (* unimplemented *)
+        (if addrbuf <> 0L then
+           let addrlen_ptr = load_word (lea msg 0 0 4) in
+           self#write_sockaddr sockaddr addrbuf addrlen_ptr);
+        self#scatter_iovec iov cnt str;
+        put_return (Int64.of_int num_read) (* success *)	)
+    with
+      | Unix.Unix_error(err, _, _) -> self#put_errno err
+
+
   method sys_rename oldpath newpath =
     try
       Unix.rename (chroot oldpath) (chroot newpath);
@@ -1477,42 +1700,78 @@ object(self)
     ignore(pid);
     put_return 0L (* SCHED_OTHER *)
 
+  method private read_timeval_as_secs addr =
+    let secs_f   = (if addr <> 0x0L then Int64.to_float (load_word addr)
+                    else -1.0) and
+        susecs_f = (if addr <> 0x0L then 
+                      Int64.to_float (load_word (lea addr 0 0 4)) 
+                    else 0.0) in
+    let ret = secs_f +. (susecs_f /. 1000000.0) in
+    ret;
+
   method sys_select nfds readfds writefds exceptfds timeout =
     let read_bitmap addr =
       if addr = 0L then
-	[]
+        []
       else
-	let l = ref [] in
-	  for i = 0 to nfds - 1 do
-	    let w = load_word (lea addr (i / 32) 4 0) and
-		b = i mod 32 in
-	      if (Int64.logand (Int64.shift_right w b) 1L) = 1L then
-		l := i :: !l
-	  done;
-	  !l
+        let l = ref [] in
+        for i = 0 to nfds - 1 do
+          let w = load_word (lea addr (i / 32) 4 0) and
+              b = i mod 32 in
+          if (Int64.logand (Int64.shift_right w b) 1L) = 1L then
+          l := i :: !l
+        done;
+        !l
+    in
+    let put_sel_fd fd_bm idx fd_w_or =
+      fm#store_word_conc (lea fd_bm idx 4 0) fd_w_or;
+    in
+    let write_bitmap fd_bm fd_l nfds =
+        zero_region fd_bm nfds;
+        for i = 0 to nfds - 1 do ( 
+          if List.mem (self#get_fd i) fd_l then (
+            let fd_lsh = Int64.shift_left 1L i in
+            let w = load_word (lea fd_bm (i / 32) 4 0) in
+            let fd_w_or = Int64.logor fd_lsh w in
+            put_sel_fd fd_bm (i / 32) fd_w_or;
+            )
+          )
+        done;
     in
     let rec format_fds l =
       match l with
-	| [] -> ""
-	| [x] -> string_of_int x
-	| x :: rest -> (string_of_int x) ^ ", " ^ (format_fds rest)
+      | [] -> ""
+      | [x] -> string_of_int x
+      | x :: rest -> (string_of_int x) ^ ", " ^ (format_fds rest)
     in
     let rl = read_bitmap readfds and
-	wl = read_bitmap writefds and
-	el = read_bitmap exceptfds in
-      if !opt_trace_syscalls then
-	Printf.printf "\nselect(%d, [%s], [%s], [%s], 0x%08Lx)"
-	  nfds (format_fds rl) (format_fds wl) (format_fds el) timeout;
-      match (rl, wl, el) with
-	| ([fd], [], []) when fd_info.(fd).fname = "/dev/urandom" ->
-	    put_return 1L (* assume /dev/urandom is always readable *)
-	| _ ->
-	    (* Our default behavior of saying that nothing ever
-	       happens works for some uses of select(), but causes others
-	       to go into an infinite loop. It would be nice to characterize
-	       what cases a 0 return works well for, and make any other
-	       cases failwith to be easier to debug. *)
-	    put_return 0L (* no events *)
+        wl = read_bitmap writefds and
+        el = read_bitmap exceptfds in
+    if !opt_trace_syscalls then
+      Printf.printf "\nselect(%d, [%s], [%s], [%s], 0x%08Lx)"
+        nfds (format_fds rl) (format_fds wl) (format_fds el) timeout;
+    try
+      let map_fd fds =
+        List.map (fun (fd) ->  (self#get_fd fd)) fds
+      in
+      let rl_file_descr = map_fd rl and 
+          wl_file_descr = map_fd wl and 
+          el_file_descr = map_fd el and
+          timeout_f = self#read_timeval_as_secs timeout in
+      let (r_fds, w_fds, e_fds) = 
+        Unix.select rl_file_descr wl_file_descr el_file_descr timeout_f in
+      let r_fds_len = (List.length r_fds) and
+          w_fds_len = (List.length w_fds) and 
+          e_fds_len = (List.length e_fds) in
+      if readfds <> 0L then 
+        write_bitmap readfds r_fds nfds;
+      if writefds <> 0L then 
+        write_bitmap writefds w_fds nfds;
+      if exceptfds <> 0L then 
+        write_bitmap exceptfds e_fds nfds;
+      put_return (Int64.of_int (r_fds_len + w_fds_len + e_fds_len))
+    with
+      | Unix.Unix_error(err, _, _) -> self#put_errno err
 
   method sys_send sockfd buf len flags =
     try
@@ -1525,6 +1784,78 @@ object(self)
 	Unix.send (self#get_fd sockfd) str 0 len flags
       in
 	put_return (Int64.of_int num_sent) (* success *)
+    with
+      | Unix.Unix_error(err, _, _) -> self#put_errno err
+
+  method sys_sendto sockfd buf len flags addrbuf addrlen =
+    try
+      if !netlink_sim_sockfd = sockfd then (
+        let netlink_req_type = load_short (lea buf 0 0 4) in
+        if netlink_req_type <> 22 then (* RTM_GETADDR *)
+          raise 
+            (Unix.Unix_error(
+              Unix.ENOSYS, "Missing implementation for rtnetlink family", ""));
+        netlink_sim_seq := load_word (lea buf 0 0 8);
+        put_return (Int64.of_int len))
+      else (
+        let str = string_of_char_array (read_buf buf len) and
+            flags = (if (flags land 1) <> 0 then [Unix.MSG_OOB] else []) @
+                    (if (flags land 4) <> 0 then [Unix.MSG_DONTROUTE] else []) @
+                    (if (flags land 2) <> 0 then [Unix.MSG_PEEK] else []) and
+            sockaddr = self#read_sockaddr addrbuf addrlen
+        in
+        let num_sent =
+          Unix.sendto (self#get_fd sockfd) str 0 len flags sockaddr
+        in
+        put_return (Int64.of_int num_sent) (* success *))
+    with
+      | Unix.Unix_error(err, _, _) -> self#put_errno err
+
+  method private sendmsg_throw sockfd msg flags =
+    let str = string_of_char_array
+      (self#gather_iovec (load_word (lea msg 0 0 8))
+      (Int64.to_int (load_word (lea msg 0 0 12))))
+    and flags = (if (flags land 1) <> 0 then [Unix.MSG_OOB] else []) @
+                (if (flags land 4) <> 0 then [Unix.MSG_DONTROUTE] else []) @
+                (if (flags land 2) <> 0 then [Unix.MSG_PEEK] else [])
+    and addrbuf = load_word (lea msg 0 0 0) in
+    let num_sent = 
+      if addrbuf = 0L then
+        Unix.send (self#get_fd sockfd) str 0 (String.length str) flags
+      else
+        let sockaddr = self#read_sockaddr addrbuf
+          (Int64.to_int (load_word (lea msg 0 0 4)))
+        in
+        Unix.sendto (self#get_fd sockfd) str 0 (String.length str)
+          flags sockaddr
+    in
+    num_sent ;
+
+  method sys_sendmsg sockfd msg flags =
+    try
+      compare_fds !netlink_sim_sockfd sockfd
+        Unix.ENOSYS "sendmsg(2) for netlink socket fd not implemented";
+      let ret = self#sendmsg_throw sockfd msg flags in
+      put_return (Int64.of_int ret);
+    with
+      | Unix.Unix_error(err, _, _) -> self#put_errno err
+
+  method sys_sendmmsg sockfd mmsg vlen flags =
+    try
+      compare_fds !netlink_sim_sockfd sockfd
+        Unix.ENOSYS "sendmmsg(2) for netlink socket fd not implemented";
+      let rec sendmmsg sockfd mmsg vlen flags =
+        let char_sent = self#sendmsg_throw sockfd mmsg flags in 
+        let send_res = (if char_sent < 0 then 0 else 1) in
+        let next_send = 
+          (if vlen > 1 && send_res = 1 then 
+             sendmmsg sockfd (lea mmsg 1 32 0) (vlen-1) flags
+           else 0) in 
+
+        fm#store_word_conc (lea mmsg 7 4 0) (Int64.of_int char_sent);
+        send_res + next_send;
+      in
+      put_return (Int64.of_int(sendmmsg sockfd mmsg vlen flags));
     with
       | Unix.Unix_error(err, _, _) -> self#put_errno err
 
@@ -1545,9 +1876,257 @@ object(self)
     with
       | Unix.Unix_error(err, _, _) -> self#put_errno err
 
+  method sys_setresuid32 new_ruid new_euid new_suid =
+    try
+      (* Similar to sys_setreuid *)
+      match (Unix.getuid (), Unix.geteuid(), new_ruid, new_euid, new_suid) with
+      | (u1, u2, 65535, 0, 65535) when u1 <> 0 && u1 = u2 ->
+        raise (Unix.Unix_error(Unix.EPERM, "setreuid", ""))
+      | (u1, u2, -1, u4, -1) when u1 <> 0 && u2 = u4 ->
+        put_return 0L (* faked for OpenSSH ssh client *)
+      | _ -> failwith "Unhandled case in setresuid32"
+    with
+      | Unix.Unix_error(err, _, _) -> self#put_errno err
+
   method sys_setuid32 uid =
     Unix.setuid uid;
     put_return 0L (* success *)
+
+  method sys_setsockopt sockfd level name valp len =
+    let as_bool () =
+      let w = load_word valp in
+	w <> 0L
+    in
+    try
+      compare_fds !netlink_sim_sockfd sockfd
+        Unix.ENOSYS "setsockopt(2) for netlink socket fd not implemented";
+      let bool_option = ref false and
+          bool_option_val = ref Unix.SO_DEBUG and
+          int_option = ref false and
+          int_option_val = ref Unix.SO_SNDBUF and
+          float_option = ref false and
+          float_option_val = ref Unix.SO_RCVTIMEO and
+          option_handled = ref false and
+          fd = self#get_fd sockfd in
+      (match (level, name) with
+	  (* 0 = SOL_IP *)
+	  | (0, 6) (* IP_RECVOPTS *) -> () (* No OCaml support *)
+      (* 1 = SOL_SOCKET *)
+      | (1, 1) ->
+        bool_option := true;
+        bool_option_val := Unix.SO_DEBUG;
+      | (1, 2) ->
+        bool_option := true;
+        bool_option_val := Unix.SO_REUSEADDR;
+      | (1, 3) ->
+        int_option := true;
+        int_option_val := Unix.SO_TYPE;
+      | (1, 5) ->
+        bool_option := true;
+        bool_option_val := Unix.SO_DONTROUTE;
+      | (1, 6) ->
+        bool_option := true;
+        bool_option_val := Unix.SO_BROADCAST;
+      | (1, 7) ->
+        int_option := true;
+        int_option_val := Unix.SO_SNDBUF;
+      | (1, 8) ->
+        int_option := true;
+        int_option_val := Unix.SO_RCVBUF;
+      | (1, 9) ->
+        bool_option := true;
+        bool_option_val := Unix.SO_KEEPALIVE;
+      | (1, 10) ->
+        bool_option := true;
+        bool_option_val := Unix.SO_OOBINLINE;
+      | (1, 11) -> (* SO_NO_CHECK *) () (* No OCaml support *)
+      | (1, 12) -> (* SO_PRIORITY *) () (* No OCaml support *)
+      | (1, 13) ->
+        let lonoff = Int64.to_int (load_word valp) and
+            linger = Int64.to_int (load_word (lea valp 1 4 0)) in
+        let linger_oc = (if lonoff <> 0 && linger <> 0 then Some linger
+                         else None) in
+        Unix.setsockopt_optint fd Unix.SO_LINGER linger_oc;
+        option_handled := true;
+      | (1, 14) -> (* SO_BSDCOMPAT *) () (* No OCaml support *)
+      | (1, 15) -> (* SO_REUSEPORT *) () (* No OCaml support *)
+      | (1, 16) -> (* SO_PASSCRED *) () (* No OCaml support *)
+      | (1, 17) -> (* SO_PEERCRED *) () (* No OCaml support *)
+      | (1, 18) ->
+        int_option := true;
+        int_option_val := Unix.SO_RCVLOWAT;
+      | (1, 19) ->
+        int_option := true;
+        int_option_val := Unix.SO_SNDLOWAT;
+      | (1, 20) ->
+        float_option := true;
+        float_option_val := Unix.SO_RCVTIMEO;
+      | (1, 21) ->
+        float_option := true;
+        float_option_val := Unix.SO_SNDTIMEO;
+      | (1, 22) -> (* SO_SECURITY_AUTHENTICATION *) () (* No OCaml support *)
+      | (1, 23) -> (* SO_SECURITY_ENCRYPTION_TRANSPORT *) 
+          () (* No OCaml support *)
+      | (1, 24) -> (* SO_SECURITY_ENCRYPTION_NETWORK *) 
+          () (* No OCaml support *)
+      | (1, 25) -> (* SO_BINDTODEVICE *) () (* No OCaml support *)
+      | (1, 26) -> (* SO_ATTACH_FILTER *) () (* No OCaml support *)
+      | (1, 27) -> (* SO_DETACH_FILTER *) () (* No OCaml support *)
+      | (1, 28) -> (* SO_PEERNAME *) () (* No OCaml support *)
+      | (1, 29) -> (* SO_TIMESTAMP *) () (* No OCaml support *)
+      | (1, 30) ->
+        bool_option := true;
+        bool_option_val := Unix.SO_ACCEPTCONN;
+      (* 6 = SOL_TCP *)
+	  | (6, 1) -> 
+        Unix.setsockopt fd Unix.TCP_NODELAY (as_bool ());
+        option_handled := true;
+	  | _ -> ()); (* ignore unrecognized options *)
+      if !option_handled = false then (
+        if !bool_option = true then (
+          Unix.setsockopt fd !bool_option_val (as_bool ());
+        )
+        else if !int_option = true then (
+          Unix.setsockopt_int fd !int_option_val 
+                              (Int64.to_int (load_word valp));
+        )
+        else if !float_option = true then (
+          let timeval_f = (self#read_timeval_as_secs valp) in
+          Unix.setsockopt_float fd !float_option_val timeval_f;
+        )
+      );
+      put_return 0L;
+    with
+      | Unix.Unix_error(err, _, _) -> self#put_errno err
+
+  method sys_getsockopt sockfd level name valp lenp =
+    let write_timeval_from_secs addr secs_f =
+      let secs   = Int64.of_float secs_f in
+      let susecs = Int64.of_float 
+                     ((secs_f -. (Int64.to_float secs))*.1000000.0) in
+      fm#store_word_conc addr secs;
+      fm#store_word_conc (lea addr 1 4 0) susecs;
+    in
+    try
+      compare_fds !netlink_sim_sockfd sockfd
+        Unix.ENOSYS "getsockopt(2) for netlink socket fd not implemented";
+      let fd = self#get_fd sockfd and
+          bool_option = ref false and
+          bool_option_val = ref Unix.SO_DEBUG and
+          int_option = ref false and
+          int_option_val = ref Unix.SO_SNDBUF and
+          float_option = ref false and
+          float_option_val = ref Unix.SO_RCVTIMEO and
+          option_handled = ref false in
+      (match (level, name) with
+      (* 0 = SOL_IP *)
+      | (0, 6) (* IP_RECVOPTS *) -> () (* No OCaml support *)
+      (* 1 = SOL_SOCKET *)
+      | (1, 1) ->
+        bool_option := true;
+        bool_option_val := Unix.SO_DEBUG;
+      | (1, 2) ->
+        bool_option := true;
+        bool_option_val := Unix.SO_REUSEADDR;
+      | (1, 3) ->
+        int_option := true;
+        int_option_val := Unix.SO_TYPE;
+      | (1, 4) ->
+        let error = Unix.getsockopt_error fd in
+        (match error with
+        | Some err ->
+          fm#store_word_conc valp (Int64.of_int ~-(self#errno err));
+        | None ->
+          fm#store_word_conc valp 0L;
+        );
+        fm#store_word_conc lenp 4L;
+        option_handled := true; 
+      | (1, 5) ->
+        bool_option := true;
+        bool_option_val := Unix.SO_DONTROUTE;
+      | (1, 6) ->
+        bool_option := true;
+        bool_option_val := Unix.SO_BROADCAST;
+      | (1, 7) ->
+        int_option := true;
+        int_option_val := Unix.SO_SNDBUF;
+      | (1, 8) ->
+        int_option := true;
+        int_option_val := Unix.SO_RCVBUF;
+      | (1, 9) ->
+        bool_option := true;
+        bool_option_val := Unix.SO_KEEPALIVE;
+      | (1, 10) ->
+        bool_option := true;
+        bool_option_val := Unix.SO_OOBINLINE;
+      | (1, 11) -> (* SO_NO_CHECK *) () (* No OCaml support *)
+      | (1, 12) -> (* SO_PRIORITY *) () (* No OCaml support *)
+      | (1, 13) ->
+        let linger_opt = Unix.getsockopt_optint fd Unix.SO_LINGER in
+        (match linger_opt with
+        | Some l_onoff ->
+          fm#store_word_conc valp 1L;
+          fm#store_word_conc (lea valp 1 4 0) (Int64.of_int l_onoff);
+          fm#store_word_conc lenp 8L;
+        | None -> (* Linger disabled *)
+          fm#store_word_conc valp 0L;
+          fm#store_word_conc lenp 4L;
+        );
+        option_handled := true;
+      | (1, 14) -> (* SO_BSDCOMPAT *) () (* No OCaml support *)
+      | (1, 15) -> (* SO_REUSEPORT *) () (* No OCaml support *)
+      | (1, 16) -> (* SO_PASSCRED *) () (* No OCaml support *)
+      | (1, 17) -> (* SO_PEERCRED *) () (* No OCaml support *)
+      | (1, 18) ->
+        int_option := true;
+        int_option_val := Unix.SO_RCVLOWAT;
+      | (1, 19) ->
+        int_option := true;
+        int_option_val := Unix.SO_SNDLOWAT;
+      | (1, 20) ->
+        float_option := true;
+        float_option_val := Unix.SO_RCVTIMEO;
+      | (1, 21) ->
+        float_option := true;
+        float_option_val := Unix.SO_SNDTIMEO;
+      | (1, 22) -> (* SO_SECURITY_AUTHENTICATION *) () (* No OCaml support *)
+      | (1, 23) -> (* SO_SECURITY_ENCRYPTION_TRANSPORT *) 
+          () (* No OCaml support *)
+      | (1, 24) -> (* SO_SECURITY_ENCRYPTION_NETWORK *) 
+          () (* No OCaml support *)
+      | (1, 25) -> (* SO_BINDTODEVICE *) () (* No OCaml support *)
+      | (1, 26) -> (* SO_ATTACH_FILTER *) () (* No OCaml support *)
+      | (1, 27) -> (* SO_DETACH_FILTER *) () (* No OCaml support *)
+      | (1, 28) -> (* SO_PEERNAME *) () (* No OCaml support *)
+      | (1, 29) -> (* SO_TIMESTAMP *) () (* No OCaml support *)
+      | (1, 30) ->
+        bool_option := true;
+        bool_option_val := Unix.SO_ACCEPTCONN;
+      (* 6 = SOL_TCP *)
+      | (6, 1) ->
+        bool_option := true;
+        bool_option_val := Unix.TCP_NODELAY;
+      | _ -> ()); (* ignore unrecognized options *)
+      if !option_handled = false then
+        if !bool_option = true then (
+          let value = (if (Unix.getsockopt fd !bool_option_val) = true then 1L
+                       else 0L) in
+          fm#store_word_conc valp value;
+          fm#store_word_conc lenp 4L;
+        )
+        else if !int_option = true then (
+          let value = Unix.getsockopt_int fd !int_option_val in
+          fm#store_word_conc valp (Int64.of_int value);
+          fm#store_word_conc lenp 4L;
+        )
+        else if !float_option = true then (
+          let secs_f = Unix.getsockopt_float fd !float_option_val in
+          write_timeval_from_secs valp secs_f;
+          fm#store_word_conc lenp 8L;
+        );
+      put_return 0L;
+    with
+      | Unix.Unix_error(err, _, _) -> self#put_errno err
 
   method sys_set_robust_list addr len =
     put_return 0L (* success *)
@@ -1653,23 +2232,39 @@ object(self)
 
   method sys_socket dom_i typ_i prot_i =
     try
+      let netlink_flag = ref false in
       let domain = match dom_i with
-	| 1 -> Unix.PF_UNIX
-	| 2 -> Unix.PF_INET
-	| 10 -> Unix.PF_INET6
-	| _ -> raise (Unix.Unix_error(Unix.EINVAL, "Bad protocol family", ""))
+      | 1 -> Unix.PF_UNIX
+      | 2 -> Unix.PF_INET
+      | 10 -> Unix.PF_INET6
+      | 16 ->
+      (match prot_i with
+      (* NETLINK_ROUTE *)
+      | 0 -> netlink_flag := true;
+        Unix.PF_INET
+      | _ -> raise 
+               (Unix.Unix_error(
+                  Unix.ENOSYS, "Missing implementation for netlink family", "")))
+      | _ -> raise (Unix.Unix_error(Unix.EINVAL, "Bad protocol family", ""))
       in
       let typ = match typ_i land 0o777 with
-	| 1 -> Unix.SOCK_STREAM
-	| 2 -> Unix.SOCK_DGRAM
-	| 3 -> Unix.SOCK_RAW
-	| 5 -> Unix.SOCK_SEQPACKET
-	| _ -> raise (Unix.Unix_error(Unix.EINVAL, "Bad socket type", ""))
+      | 1 -> Unix.SOCK_STREAM
+      | 2 -> Unix.SOCK_DGRAM
+      | 3 -> Unix.SOCK_RAW
+      | 5 -> Unix.SOCK_SEQPACKET
+      | _ -> raise (Unix.Unix_error(Unix.EINVAL, "Bad socket type", ""))
       in
-      let oc_fd = Unix.socket domain typ prot_i and
-	  vt_fd = self#fresh_fd () in
-	Array.set unix_fds vt_fd (Some oc_fd);
-	put_return (Int64.of_int vt_fd)
+      if !netlink_flag = false then (
+        let oc_fd = Unix.socket domain typ prot_i and
+        vt_fd = self#fresh_fd () in
+        Array.set unix_fds vt_fd (Some oc_fd);
+        put_return (Int64.of_int vt_fd))
+      else (
+        let vt_fd = self#fresh_fd () in
+        netlink_sim_sockfd := vt_fd;
+        (* Plugging in a placeholder into unix_fds *)
+        Array.set unix_fds vt_fd (Some Unix.stdin);
+        put_return (Int64.of_int vt_fd))
     with 
       | Unix.Unix_error(err, _, _) -> self#put_errno err
 
@@ -1692,7 +2287,7 @@ object(self)
   method sys_fstat fd buf_addr =
     try
       let oc_buf =
-	(if (fd <> 1 or true) then
+	(if (fd <> 1 || true) then
 	   Unix.fstat (self#get_fd fd)
 	 else
 	   Unix.stat "/etc/group") (* pretend stdout is always redirected *) in
@@ -1720,7 +2315,7 @@ object(self)
   method sys_fstat64 fd buf_addr =
     try
       let oc_buf =
-	(if (fd <> 1 or true) then
+	(if (fd <> 1 || true) then
 	   Unix.fstat (self#get_fd fd)
 	 else
 	   Unix.stat "/etc/group") (* pretend stdout is always redirected *) in
@@ -1742,6 +2337,10 @@ object(self)
   method sys_statfs64 path buf_len struct_buf =
     assert(buf_len = 84 || buf_len = 88); (* Same layout, different padding *)
     self#write_fake_statfs64buf struct_buf;
+    put_return 0L (* success *)
+
+  method sys_fsync fd =
+    ignore(fd);
     put_return 0L (* success *)
 
   method sys_tgkill tgid tid signal : unit =
@@ -1774,14 +2373,33 @@ object(self)
     let old_mask = Unix.umask new_mask in
       put_return (Int64.of_int old_mask)
 
+  method private one_line_from_cmd cmd =
+    let ic = Unix.open_process_in cmd in
+    let s = try
+      input_line ic
+    with
+      | End_of_file -> ""
+    in
+      ignore(Unix.close_process_in ic);
+      s
+
+  method private external_uname =
+    [(self#one_line_from_cmd "uname -s");
+     (self#one_line_from_cmd "uname -n");
+     (self#one_line_from_cmd "uname -r");
+     (self#one_line_from_cmd "uname -v");
+     (self#one_line_from_cmd "uname -m");
+     (self#one_line_from_cmd "domainname")]
+
   method sys_uname buf =
     let nodename = (Unix.gethostname ()) in
       List.iter2
 	(fun i str ->
 	   fm#store_cstr buf (Int64.mul 65L i) str)
 	[0L; 1L; 2L; 3L; 4L; 5L]
-	(match !opt_arch with
-	   | X86 ->
+	(match (!opt_external_uname, !opt_arch) with
+	   | (true, _) -> self#external_uname
+	   | (false, X86) ->
 	       ["Linux"; (* sysname *)
 		nodename; (* nodename *)
 		"2.6.32-5-amd64"; (* release *)
@@ -1789,7 +2407,7 @@ object(self)
 		"i686"; (* machine *)
 		"example.com" (* domain *)
 	       ]
-	   | X64 ->
+	   | (false, X64) ->
 	       ["Linux"; (* sysname *)
 		nodename; (* nodename *)
 		"2.6.32-5-amd64"; (* release *)
@@ -1797,7 +2415,7 @@ object(self)
 		"x86_64"; (* machine *)
 		"example.com" (* domain *)
 	       ]
-	   | ARM ->
+	   | (false, ARM) ->
 	       ["Linux"; (* sysname *)
 		nodename; (* nodename *)
 		"2.6.32-5-versatile"; (* release *)
@@ -1843,15 +2461,34 @@ object(self)
   method sys_write fd bytes count =
     self#do_write fd bytes count
 
+  method private iovec_size iov cnt =
+    let sum = ref 0 in
+      for i = 0 to cnt - 1 do
+	let len = Int64.to_int (load_word (lea iov i 8 4)) in
+	  sum := !sum + len
+      done;
+      !sum
+
+  method private scatter_iovec iov cnt buf =
+    let off = ref 0 in
+      for i = 0 to cnt - 1 do
+	let base = load_word (lea iov i 8 0) and
+	    len = Int64.to_int (load_word (lea iov i 8 4))
+	in
+	  fm#store_str base 0L (String.sub buf !off len);
+	  off := !off + len
+      done
+
+  method private gather_iovec iov cnt =
+    Array.concat
+      (Vine_util.mapn
+	 (fun i -> read_buf
+	    (load_word (lea iov i 8 0)) (* iov_base *)
+	    (Int64.to_int (load_word (lea iov i 8 4)))) (* iov_len *)
+	 (cnt - 1))
+
   method sys_writev fd iov cnt =
-    let bytes =
-      Array.concat
-	(Vine_util.mapn
-	   (fun i -> read_buf
-	      (load_word (lea iov i 8 0)) (* iov_base *)
-	      (Int64.to_int (load_word (lea iov i 8 4))))
-	   (* iov_len *)
-	   (cnt - 1)) in
+    let bytes = self#gather_iovec iov cnt in
       self#do_write fd bytes (Array.length bytes)
 
   method private handle_linux_syscall () =
@@ -2369,7 +3006,15 @@ object(self)
 			if !opt_trace_syscalls then
 			  Printf.printf "listen(%d, %d)" sockfd backlog;
 			self#sys_listen sockfd backlog
-		  | 5 -> uh"Unhandled Linux system call accept (102:5)"
+          | 5 ->
+              let sockfd = Int64.to_int (load_word args) and
+              addr = load_word (lea args 0 0 4) and
+              addrlen_ptr = load_word (lea args 0 0 8)
+		      in
+			  if !opt_trace_syscalls then
+			    Printf.printf "accept(%d, 0x%08Lx, 0x%08Lx)"
+			      sockfd addr addrlen_ptr;
+			  self#sys_accept sockfd addr addrlen_ptr
 		  | 6 ->
 		      let sockfd = Int64.to_int (load_word args) and
 			  addr = load_word (lea args 0 0 4) and
@@ -2409,13 +3054,83 @@ object(self)
 			  Printf.printf "recv(%d, 0x%08Lx, %d, %d)"
 			    sockfd buf len flags;
 			self#sys_recv sockfd buf len flags
-		  | 11 -> uh"Unhandled Linux system call sendto (102:11)"
-		  | 12 -> uh"Unhandled Linux system call recvfrom (102:12)"
-		  | 13 -> uh"Unhandled Linux system call shutdown (102:13)"
-		  | 14 -> uh"Unhandled Linux system call setsockopt (102:14)"
-		  | 15 -> uh"Unhandled Linux system call getsockopt (102:15)"
-		  | 16 -> uh"Unhandled Linux system call sendmsg (102:16)"
-		  | 17 -> uh"Unhandled Linux system call recvmsg (102:17)"
+		  | 11 ->
+		      let sockfd = Int64.to_int (load_word args) and
+			  buf = load_word (lea args 0 0 4) and
+			  len = Int64.to_int (load_word (lea args 0 0 8)) and
+			  flags = Int64.to_int (load_word (lea args 0 0 12))
+									  and
+			  addr = load_word (lea args 0 0 16) and
+			  addrlen = Int64.to_int (load_word (lea args 0 0 20))
+		      in
+			if !opt_trace_syscalls then
+			  Printf.printf
+			    "sendto(%d, 0x%08Lx, %d, %d, 0x%08Lx, %d)"
+			    sockfd buf len flags addr addrlen;
+			self#sys_sendto sockfd buf len flags addr addrlen
+		  | 12 ->
+		      let sockfd = Int64.to_int (load_word args) and
+			  buf = load_word (lea args 0 0 4) and
+			  len = Int64.to_int (load_word (lea args 0 0 8)) and
+			  flags = Int64.to_int (load_word (lea args 0 0 12))
+									  and
+			  addr = load_word (lea args 0 0 16) and
+			  addrlen_ptr = load_word (lea args 0 0 20)
+		      in
+			if !opt_trace_syscalls then
+			  Printf.printf
+			    "recvfrom(%d, 0x%08Lx, %d, %d, 0x%08Lx, 0x%08Lx)"
+			    sockfd buf len flags addr addrlen_ptr;
+			self#sys_recvfrom sockfd buf len flags addr addrlen_ptr
+		  | 13 ->
+              let sockfd = Int64.to_int (load_word args) and
+                  how = Int64.to_int (load_word(lea args 0 0 4)) in
+              if !opt_trace_syscalls then
+                Printf.printf "shutdown(%d, %d)" sockfd how;
+              self#sys_shutdown sockfd how 
+		  | 14 ->
+		      let sockfd = Int64.to_int (load_word args) and
+			  level = Int64.to_int (load_word (lea args 0 0 4)) and
+			  name = Int64.to_int (load_word (lea args 0 0 8)) and
+			  valp = load_word (lea args 0 0 12) and
+			  len = Int64.to_int (load_word (lea args 0 0 16))
+		      in
+			if !opt_trace_syscalls then
+			  Printf.printf
+			    "setsockopt(%d, %d, %d, 0x%08Lx, %d)"
+			    sockfd level name valp len;
+			self#sys_setsockopt sockfd level name valp len
+		  | 15 ->
+              let sockfd = Int64.to_int (load_word args) and
+			  level = Int64.to_int (load_word (lea args 0 0 4)) and
+			  name = Int64.to_int (load_word (lea args 0 0 8)) and
+			  valp = load_word (lea args 0 0 12) and
+			  lenp = load_word (lea args 0 0 16)
+		      in
+			if !opt_trace_syscalls then
+			  Printf.printf
+			    "getsockopt(%d, %d, %d, 0x%08Lx, 0x%08Lx)"
+			    sockfd level name valp lenp;
+			self#sys_getsockopt sockfd level name valp lenp
+
+		  | 16 ->
+		      let sockfd = Int64.to_int (load_word args) and
+			  msg = load_word (lea args 0 0 4) and
+			  flags = Int64.to_int (load_word (lea args 0 0 8))
+		      in
+			if !opt_trace_syscalls then
+			  Printf.printf "sendmsg(%d, 0x%08Lx, %d)"
+			    sockfd msg flags;
+			self#sys_sendmsg sockfd msg flags
+		  | 17 ->
+		      let sockfd = Int64.to_int (load_word args) and
+			  msg = load_word (lea args 0 0 4) and
+			  flags = Int64.to_int (load_word (lea args 0 0 8))
+		      in
+			if !opt_trace_syscalls then
+			  Printf.printf "recvmsg(%d, 0x%08Lx, %d)"
+			    sockfd msg flags;
+			self#sys_recvmsg sockfd msg flags
 		  | 18 -> uh"Unhandled Linux system call accept4 (102:18)"
 		  | _ -> self#put_errno Unix.EINVAL)
 	 | (_, 103) -> (* syslog *)
@@ -2485,7 +3200,11 @@ object(self)
 		   call first second third ptr fifth;
 	       self#put_errno Unix.ENOSYS
 	 | (_, 118) -> (* fsync *)
-	     uh "Unhandled Linux system call fsync (118)"
+	     let arg1 = read_1_reg () in
+	     let fd = Int64.to_int arg1 in
+	       if !opt_trace_syscalls then
+		 Printf.printf "fsync(%d)" fd;
+	       self#sys_fsync fd
 	 | (_, 119) -> (* sigreturn *)
 	     uh "Unhandled Linux system call sigreturn (119)"
 	 | (_, 120) -> (* clone *)
@@ -2597,7 +3316,13 @@ object(self)
 	 | (_, 144) -> (* msync *)
 	     uh "Unhandled Linux system call msync (144)"
 	 | (_, 145) -> (* readv *)
-	     uh "Unhandled Linux system call readv (145)"
+	     let (arg1, arg2, arg3) = read_3_regs () in
+	     let fd  = Int64.to_int arg1 and
+		 iov = arg2 and
+		 cnt = Int64.to_int arg3 in
+	       if !opt_trace_syscalls then
+		 Printf.printf "readv(%d, 0x%08Lx, %d)" fd iov cnt;
+	       self#sys_readv fd iov cnt
 	 | (_, 146) -> (* writev *)
 	     let (arg1, arg2, arg3) = read_3_regs () in
 	     let fd  = Int64.to_int arg1 and
@@ -2721,7 +3446,15 @@ object(self)
 	 | (_, 179) -> (* rt_sigsuspend *)
 	     uh "Unhandled Linux system call rt_sigsuspend (179)"
 	 | (_, 180) -> (* pread64 *)
-	     uh "Unhandled Linux system call pread64 (180)"
+	     let (arg1, arg2, arg3, arg4, arg5) = read_5_regs () in
+	     let fd    = Int64.to_int arg1 and
+		 buf   = arg2 and
+		 count = Int64.to_int arg3 and
+		 off   = Int64.logor (Int64.shift_left arg5 32) arg4 in
+	       if !opt_trace_syscalls then
+		 Printf.printf "pread64(%d, 0x%08Lx, %d, %Ld)"
+		   fd buf count off;
+	       self#sys_pread64 fd buf count off;
 	 | (_, 181) -> (* pwrite64 *)
 	     uh "Unhandled Linux system call pwrite64 (181)"
 	 | (_, 182) -> (* chown *)
@@ -2839,7 +3572,12 @@ object(self)
 		 Printf.printf "getgroups32(%d, 0x%08Lx)" size list;
 	       self#sys_getgroups32 size list
 	 | (_, 206) -> (* setgroups32 *)
-	     uh "Unhandled Linux system call setgroups32 (206)"
+         let (ebx, ecx) = read_2_regs () in
+         let size = Int64.to_int ebx and
+         list = ecx in
+         if !opt_trace_syscalls then
+           Printf.printf "setgroups32(%d, 0x%08Lx)" size list;
+         self#sys_setgroups32 size list
 	 | (ARM, 207) -> uh "Check whether ARM fchown32 syscall matches x86"
 	 | (X86, 207) -> (* fchown32 *)
 	     let (ebx, ecx, edx) = read_3_regs () in
@@ -2850,7 +3588,13 @@ object(self)
 		 Printf.printf "fchown32(%d, %d, %d)" fd user group;
 	       self#sys_fchown32 fd user group
 	 | (_, 208) -> (* setresuid32 *)
-	     uh "Unhandled Linux system call setresuid32 (208)"
+         let (ebx, ecx, edx) = read_3_regs () in
+         let ruid = Int64.to_int ebx and
+         euid = Int64.to_int ecx and
+         suid = Int64.to_int edx in
+         if !opt_trace_syscalls then
+           Printf.printf "setresuid32(%d, %d, %d)" ruid euid suid;
+         self#sys_setresuid32 ruid euid suid
 	 | (ARM, 209) -> uh "Check whether ARM getresuid32 syscall matches x86"
 	 | (X86, 209) -> (* getresuid32 *)
 	     let (ebx, ecx, edx) = read_3_regs () in
@@ -3297,7 +4041,20 @@ object(self)
 	     uh "Unhandled Linux/x86 system call migrate_pages (294)"
 	 | (ARM, 322)    (* openat *)
 	 | (X86, 295) -> (* openat *)
-	     uh "Unhandled Linux system call openat"
+         let (arg1, arg2, arg3) = read_3_regs () in
+         let arg4 = (if (Int64.logand arg3 0o100L) <> 0L then
+                       get_reg arg_regs.(3)
+                     else
+                       0L) in
+         let dirfd    = Int64.to_int arg1 and
+             path_buf = arg2 and
+             flags    = Int64.to_int arg3 and
+             mode     = Int64.to_int arg4 in
+         let path = fm#read_cstr path_buf in
+         if !opt_trace_syscalls then
+           Printf.printf "openat(%d, \"%s\", 0x%x, 0o%o)" dirfd path flags mode;
+         self#sys_openat dirfd path flags mode
+
 	 | (ARM, 323)    (* mkdirat *)
 	 | (X86, 296) -> (* mkdirat *)
 	     uh "Unhandled Linux system call mkdirat"
@@ -3464,7 +4221,18 @@ object(self)
 	     uh "Unhandled Linux system call clock_adjtime (343)"
 	 | (X86, 344) -> (* syncfs *)
 	     uh "Unhandled Linux system call syncfs (344)"
-	 
+       | (X86, 345) -> (* sendmmsg *)
+           let (ebx, ecx, edx, esi) = read_4_regs () in
+           let sockfd = Int64.to_int ebx and
+               msg = ecx and
+               vlen = Int64.to_int edx and
+               flags = Int64.to_int esi
+           in
+           if !opt_trace_syscalls then
+             Printf.printf "sendmmsg(%d, 0x%08Lx, %d, %d)"
+               sockfd msg vlen flags;
+           self#sys_sendmmsg sockfd msg vlen flags
+
 	 | (ARM, 0xf0001) -> (* breakpoint *)
 	     uh "Unhandled Linux/ARM pseudo-syscall breakpoint (0xf0001)"
 	 | (ARM, 0xf0002) -> (* cacheflush *)

@@ -23,7 +23,6 @@ val next_periodic_influence : int ref
 val opt_trace_temps : bool ref
 val opt_trace_temps_encoded : bool ref
 val opt_use_tags : bool ref
-val opt_print_callrets : bool ref
 val opt_fail_offset_heuristic : bool ref
 val opt_trace_solver : bool ref
 val opt_measure_influence_syscall_args : bool ref
@@ -63,6 +62,7 @@ val opt_trace_binary_paths_bracketed : bool ref
 val opt_trace_insns : bool ref
 val opt_trace_loads : bool ref
 val opt_trace_stores : bool ref
+val opt_trace_callstack : bool ref
 val opt_trace_sym_addrs : bool ref
 val opt_trace_sym_addr_details : bool ref
 val opt_trace_syscalls : bool ref
@@ -99,6 +99,7 @@ val opt_time_stats : bool ref
 val opt_nonfatal_solver : bool ref
 val opt_num_paths : int64 option ref
 val opt_pid : int ref
+val opt_external_uname : bool ref
 val opt_translation_cache_size : int option ref
 val opt_prefix_out : string option ref
 val opt_omit_pf_af : bool ref
@@ -124,6 +125,9 @@ val opt_table_limit : int ref
 val opt_implied_value_conc : bool ref
 val opt_trace_ivc : bool ref
 val opt_periodic_stats : int64 option ref
+val opt_trace_global_ce_cache : bool ref
+val opt_trace_working_ce_cache : bool ref
+val opt_global_ce_cache_limit : int ref
 
 val opt_symbolic_memory : bool ref
 val opt_zero_memory : bool ref
